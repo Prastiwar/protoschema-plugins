@@ -24,6 +24,7 @@ import (
 
 	"buf.build/gen/go/bufbuild/protovalidate/protocolbuffers/go/buf/validate"
 	"buf.build/go/protovalidate"
+	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/reflect/protoreflect"
 )
 
@@ -568,6 +569,9 @@ type enumValueSelector struct {
 	remove bool
 	number int32
 	name   protoreflect.Name
+	// desc is kept so that getEnumValueAnnotations can read the value's options
+	// (e.g. custom proto extensions) after the remove/filter logic has run.
+	desc protoreflect.EnumValueDescriptor
 }
 
 func (p *Generator) generateEnumValidation(field protoreflect.FieldDescriptor, hasImplicitPresence bool, rules *validate.FieldRules, schema map[string]any) {
@@ -592,6 +596,7 @@ func (p *Generator) generateEnumValidation(field protoreflect.FieldDescriptor, h
 			remove: !allowZero && val.Number() == 0,
 			number: int32(val.Number()),
 			name:   val.Name(),
+			desc:   val,
 		}
 	}
 
@@ -665,6 +670,25 @@ func (p *Generator) generateEnumValidation(field protoreflect.FieldDescriptor, h
 
 	schema["title"] = nameToTitle(field.Enum().Name())
 	p.generateDefault(field, hasImplicitPresence, rules, schema)
+
+	// Collect custom proto extensions from each enum value that survived filtering
+	// (i.e. not removed by const/in/not_in rules) and attach them under the
+	// "x-enum-annotations" key. The "x-" prefix follows the JSON Schema convention
+	// for custom vocabulary keywords. Only values that actually carry extensions are
+	// included, so the key is omitted entirely when no annotations are present.
+	enumAnnotations := map[string]map[string]any{}
+	for _, enumValue := range enumValues {
+		if enumValue.remove {
+			continue
+		}
+		annotations := getEnumValueAnnotations(enumValue.desc)
+		if len(annotations) > 0 {
+			enumAnnotations[string(enumValue.name)] = annotations
+		}
+	}
+	if len(enumAnnotations) > 0 {
+		schema["x-enum-annotations"] = enumAnnotations
+	}
 }
 
 func (p *Generator) generateEnumInt32Validation(int32Values []int32, anyOf []map[string]any) []map[string]any {
@@ -1504,6 +1528,143 @@ func (p *Generator) makeWktGenerators() map[protoreflect.FullName]func(protorefl
 	result["google.protobuf.UInt32Value"] = p.generateWrapperValidation
 	result["google.protobuf.UInt64Value"] = p.generateWrapperValidation
 	return result
+}
+
+// getEnumValueAnnotations returns a map of extension name -> value for all
+// custom extensions set on the given enum value's options (e.g. `(danger) = true`).
+//
+// Two passes are needed because the same extension can appear in two different
+// forms depending on how the descriptor reached the plugin:
+//
+//   - Pass 1 (Range): when the plugin binary itself imports the proto that defines
+//     the extension
+//
+//   - Pass 2 (unknown fields): the common case when running as a protoc/buf plugin.
+//     buf serialises the CodeGeneratorRequest as binary protobuf and sends it over
+//     stdin. Because the plugin binary has never imported the user's proto, the
+//     extension type is NOT in the global registry. proto.Unmarshal therefore stores
+//     the raw bytes in the "unknown fields" of EnumValueOptions instead of decoding
+//     them as typed values. We parse those bytes manually using protowire and resolve
+//     the field number back to a name/kind via the file descriptor set.
+//
+// The alreadySet guard ensures Pass 2 never overwrites a value found by Pass 1.
+func getEnumValueAnnotations(val protoreflect.EnumValueDescriptor) map[string]any {
+	opts := val.Options()
+	if opts == nil {
+		return nil
+	}
+	result := map[string]any{}
+
+	// Pass 1: iterate over typed extension fields visible through reflection.
+	// This path is exercised when the extension type is registered globally,
+	// e.g. when running tests that compile the proto in-process with protocompile.
+	opts.ProtoReflect().Range(func(fd protoreflect.FieldDescriptor, v protoreflect.Value) bool {
+		if fd.IsExtension() {
+			result[string(fd.Name())] = v.Interface()
+		}
+		return true
+	})
+
+	// Pass 2: parse raw unknown-field bytes for extensions that are defined in the
+	// file descriptor set but whose Go type is not in the global registry.
+	// This is the normal case when buf invokes the plugin as an external binary.
+	unknown := opts.ProtoReflect().GetUnknown()
+	if len(unknown) > 0 {
+		// Build a field-number → ExtensionDescriptor map by walking the file that
+		// defines this enum value and all its transitive imports. This lets us
+		// translate a raw field number (e.g. 50001) into a name ("danger") and
+		// kind (BoolKind) without needing the Go type to be registered.
+		extMap := map[protowire.Number]protoreflect.ExtensionDescriptor{}
+		collectEnumValueExtensions(val.ParentFile(), extMap, map[string]struct{}{})
+
+		b := []byte(unknown)
+	outer:
+		for len(b) > 0 {
+			// Each encoded field starts with a tag: field number + wire type packed
+			// into a varint. ConsumeTag splits them back out.
+			num, typ, n := protowire.ConsumeTag(b)
+			if n < 0 {
+				break // malformed input
+			}
+			b = b[n:]
+			ext, known := extMap[num]
+			switch typ {
+			case protowire.VarintType:
+				// Varint wire type covers bool, int32, int64, uint32, uint64, sint32,
+				// sint64, and enum. We only need to distinguish bool from the integer
+				// types to pick the right Go representation.
+				v, n := protowire.ConsumeVarint(b)
+				if n < 0 {
+					break outer
+				}
+				b = b[n:]
+				if known {
+					name := string(ext.Name())
+					if _, alreadySet := result[name]; !alreadySet {
+						if ext.Kind() == protoreflect.BoolKind {
+							result[name] = v != 0
+						} else {
+							result[name] = int64(v) //nolint:gosec
+						}
+					}
+				}
+			case protowire.BytesType:
+				// Bytes wire type covers string, bytes, and embedded messages.
+				// We only surface string-kinded extensions; others are skipped.
+				v, n := protowire.ConsumeBytes(b)
+				if n < 0 {
+					break outer
+				}
+				b = b[n:]
+				if known && ext.Kind() == protoreflect.StringKind {
+					name := string(ext.Name())
+					if _, alreadySet := result[name]; !alreadySet {
+						result[name] = string(v)
+					}
+				}
+			default:
+				// Fixed32, fixed64, start/end group — skip the value bytes without
+				// decoding. ConsumeFieldValue advances past the right number of bytes
+				// for any wire type.
+				n = protowire.ConsumeFieldValue(num, typ, b)
+				if n < 0 {
+					break outer
+				}
+				b = b[n:]
+			}
+		}
+	}
+
+	if len(result) == 0 {
+		return nil
+	}
+	return result
+}
+
+// collectEnumValueExtensions populates result with every top-level extension of
+// google.protobuf.EnumValueOptions found in file and its transitive imports,
+// keyed by the extension's field number.
+// NOTE: custom enum values have to be in the root of document, which is
+// recommended .proto approach
+func collectEnumValueExtensions(file protoreflect.FileDescriptor, result map[protowire.Number]protoreflect.ExtensionDescriptor, visited map[string]struct{}) {
+	if _, ok := visited[file.Path()]; ok {
+		return // already visited, avoid infinite loops in diamond imports
+	}
+	visited[file.Path()] = struct{}{}
+
+	// file.Extensions() returns only top-level extensions defined in this file.
+	// Extensions nested inside a message scope would require descending into
+	// Messages(), but proto style guides recommend top-level extension declarations,
+	// which is the common pattern for custom options.
+	for i := range file.Extensions().Len() {
+		ext := file.Extensions().Get(i)
+		if ext.ContainingMessage().FullName() == "google.protobuf.EnumValueOptions" {
+			result[protowire.Number(ext.Number())] = ext
+		}
+	}
+	for i := range file.Imports().Len() {
+		collectEnumValueExtensions(file.Imports().Get(i), result, visited)
+	}
 }
 
 func (p *Generator) shouldIgnoreField(fdesc protoreflect.FieldDescriptor) FieldVisibility {
